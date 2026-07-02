@@ -290,7 +290,7 @@ const io = new SocketIOServer(httpServer, { cors: { origin: true } });
 
 const MATCH_CONFIG = {
   individual: { label: 'Individual', size: 8, teams: false },
-  teams: { label: 'Teams', size: 8, teams: true, teamSize: 4 },
+  teams: { label: 'Teams', size: 8, teams: true, teamSize: 2, teamLabels: ['A','B','C','D'] },
 };
 const queues = { individual: [], teams: [] };
 const queueTimers = {};
@@ -339,7 +339,7 @@ function emitMatch(mode, tickets, forcedByTimer = false) {
       id: t ? (t.profileId || t.socketId) : `ai:${matchId}:${i + 1}`,
       name: t ? t.username : `AI Raider ${i + 1}`,
       slot: i + 1,
-      team: cfg.teams ? (i < cfg.teamSize ? 'A' : 'B') : null,
+      team: cfg.teams ? (cfg.teamLabels?.[Math.floor(i / cfg.teamSize)] || 'A') : null,
       isAI: !t,
     });
   }
