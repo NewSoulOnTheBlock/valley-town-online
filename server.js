@@ -343,6 +343,8 @@ function emitMatch(mode, tickets, forcedByTimer = false) {
     const socket = io.sockets.sockets.get(t.socketId);
     if (!socket) continue;
     socket.join(`match:${matchId}`);
+    socket.data.matchId = matchId;
+    socket.data.matchMode = mode;
     const mine = roster.find(r => r.id === (t.profileId || t.socketId));
     socket.emit('match:found', { matchId, mode, label: cfg.label, seed, roster, aiCount, forcedByTimer, team: mine?.team || null, slot: mine?.slot || null, launchInMs: 3500 });
   }
@@ -381,8 +383,19 @@ io.on('connection', socket => {
     scheduleQueueTimer(mode);
   });
   socket.on('queue:leave', () => { removeFromQueues(socket.id); socket.emit('queue:left'); });
+  socket.on('raid:update', (data = {}) => {
+    const matchId = socket.data.matchId;
+    if (!matchId || data.matchId !== matchId) return;
+    socket.to(`match:${matchId}`).emit('raid:peer', {
+      id: socket.data.profileId || socket.id,
+      name: socket.data.username || `Raider-${socket.id.slice(0, 4)}`,
+      team: data.team || null, slot: data.slot || null, x: Number(data.x)||0, y: Number(data.y)||0,
+      ang: Number(data.ang)||0, hp: Number(data.hp)||0, maxHp: Number(data.maxHp)||0, dead: !!data.dead,
+      interior: data.interior || null, t: Date.now(),
+    });
+  });
   socket.on('party:create', () => socket.emit('party:update', { id: newId('party'), code: crypto.randomBytes(3).toString('hex').toUpperCase(), members: [socket.id] }));
-  socket.on('disconnect', () => removeFromQueues(socket.id));
+  socket.on('disconnect', () => { if (socket.data.matchId) socket.to(`match:${socket.data.matchId}`).emit('raid:left', { id: socket.data.profileId || socket.id }); removeFromQueues(socket.id); });
 });
 
 const port = Number(process.env.PORT || 4173);
