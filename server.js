@@ -165,7 +165,6 @@ async function saveProfileData(profileId, data) {
 const app = express();
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(express.json({ limit: '1mb' }));
-app.use(express.static(PUBLIC_DIR, { extensions: ['html'] }));
 
 async function requireAuth(req, res, next) {
   try {
@@ -199,6 +198,9 @@ app.put('/api/profile', requireAuth, async (req, res, next) => {
   try { res.json({ profile: publicProfile(await saveProfileData(req.profile.id, req.body.data)) }); }
   catch (e) { next(e); }
 });
+
+app.get('/', (_req, res) => res.sendFile(path.join(PUBLIC_DIR, 'index.html')));
+app.use(express.static(PUBLIC_DIR, { extensions: ['html'] }));
 
 app.use((err, _req, res, _next) => {
   const status = err.status || 500;
