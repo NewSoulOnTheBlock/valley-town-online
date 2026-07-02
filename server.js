@@ -298,7 +298,6 @@ const activeMatches = new Map();
 const SERVER_TICK_MS = 100;
 const SERVER_EXTRACTION_MS = Number(process.env.SERVER_EXTRACTION_MS || 35_000);
 const SERVER_ENEMY_DAMAGE = { drone: 10, hornet: 16, sentry: 24, stalker: 30, centipede: 54 };
-const SERVER_AMMO_TYPES = ['light','shell','rifle','energy'];
 const AI_RAIDER_CLASSES = ['Assault_Class','Grenadier_Class','MachineGunner_Class','RadioOperator_Class','Sniper_Class','SquadLeader'];
 const QUEUE_TIMEOUT_MS = Number(process.env.QUEUE_TIMEOUT_MS || 60_000);
 let matchSeq = 1;
@@ -430,11 +429,9 @@ function emitSnapshot(matchId) {
 }
 
 function serverLoot(match, x, y) {
-  const kind = Math.random() < 0.78 ? 'ammo' : 'scrap';
+  const kind = 'scrap';
   const id = `srvloot:${match.matchId}:${match.seq++}`;
-  const loot = kind === 'ammo'
-    ? { id, kind, ammo: SERVER_AMMO_TYPES[Math.floor(Math.random() * SERVER_AMMO_TYPES.length)], val: 4 + Math.floor(Math.random() * 12), x, y }
-    : { id, kind, val: 4 + Math.floor(Math.random() * 14), x, y };
+  const loot = { id, kind, val: 4 + Math.floor(Math.random() * 14), x, y };
   match.loot.set(id, loot);
   return loot;
 }
@@ -568,7 +565,7 @@ io.on('connection', socket => {
     if (!match) return;
     match.players.set(socket.data.profileId || socket.id, playerPayload(socket, data));
     seedAiRaiders(match, data);
-    if (data.ammo) match.inventories.set(socket.data.profileId || socket.id, { ammo: data.ammo, lastFire: 0 });
+    match.inventories.set(socket.data.profileId || socket.id, { ammo: {}, lastFire: 0 });
     emitSnapshot(matchId);
   });
   socket.on('raid:update', (data = {}) => {
@@ -589,12 +586,9 @@ io.on('connection', socket => {
     const id = socket.data.profileId || socket.id;
     const inv = match.inventories.get(id) || { ammo: {}, lastFire: 0 };
     const now = Date.now(); if (now - inv.lastFire < 35) return;
-    const ak = data.ammoType || 'light', need = Math.max(1, Math.min(12, Number(data.need)||1));
-    if (inv.ammo && inv.ammo[ak] !== undefined) { if (inv.ammo[ak] < need) return; inv.ammo[ak] -= need; }
-    inv.lastFire = now; match.inventories.set(id, inv);
+    inv.lastFire = now; inv.ammo = {}; match.inventories.set(id, inv);
     const bullets = (data.bullets || []).slice(0, 12).map((b, i) => ({ id: `srvb:${matchId}:${match.seq++}`, owner: id, x: Number(b.x)||0, y: Number(b.y)||0, vx: Math.max(-1800, Math.min(1800, Number(b.vx)||0)), vy: Math.max(-1800, Math.min(1800, Number(b.vy)||0)), t: Math.max(.05, Math.min(2.5, Number(b.t)||.8)), dmg: Math.max(1, Math.min(80, Number(b.dmg)||1)), pierce: Math.max(0, Math.min(8, Number(b.pierce)||0)), hit: [] }));
     match.bullets.push(...bullets);
-    socket.emit('raid:ammo', { matchId, ammo: inv.ammo });
     io.to(`match:${matchId}`).emit('raid:bullet', { matchId, from: id, bullets, serverTime: now });
   });
   socket.on('raid:bullet', data => relayAuthoritative(socket, 'raid:bullet', data));
