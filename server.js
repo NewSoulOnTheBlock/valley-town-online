@@ -294,7 +294,7 @@ const MATCH_CONFIG = {
 };
 const queues = { individual: [], teams: [] };
 const queueTimers = {};
-const QUEUE_TIMEOUT_MS = Number(process.env.QUEUE_TIMEOUT_MS || 180_000);
+const QUEUE_TIMEOUT_MS = Number(process.env.QUEUE_TIMEOUT_MS || 60_000);
 let matchSeq = 1;
 
 function queueDeadline(mode) { return queues[mode][0] ? queues[mode][0].enqueuedAt + QUEUE_TIMEOUT_MS : null; }
