@@ -293,11 +293,15 @@ const MATCH_CONFIG = {
   teams: { label: 'Teams', size: 8, teams: true, teamSize: 4 },
 };
 const queues = { individual: [], teams: [] };
+const queueTimers = {};
+const QUEUE_TIMEOUT_MS = Number(process.env.QUEUE_TIMEOUT_MS || 180_000);
 let matchSeq = 1;
 
+function queueDeadline(mode) { return queues[mode][0] ? queues[mode][0].enqueuedAt + QUEUE_TIMEOUT_MS : null; }
 function queueView(mode) {
   const cfg = MATCH_CONFIG[mode] || MATCH_CONFIG.individual;
-  return { mode, label: cfg.label, count: queues[mode].length, needed: cfg.size, players: queues[mode].map((t, i) => ({ name: t.username, position: i + 1 })) };
+  const queueEndsAt = queueDeadline(mode);
+  return { mode, label: cfg.label, count: queues[mode].length, needed: cfg.size, queueEndsAt, timeoutMs: QUEUE_TIMEOUT_MS, players: queues[mode].map((t, i) => ({ name: t.username, position: i + 1 })) };
 }
 function removeFromQueues(socketId) {
   let removed = false;
@@ -306,35 +310,51 @@ function removeFromQueues(socketId) {
     queues[mode] = queues[mode].filter(t => t.socketId !== socketId);
     removed ||= queues[mode].length !== before;
   }
-  if (removed) broadcastQueues();
+  if (removed) { broadcastQueues(); Object.keys(queues).forEach(scheduleQueueTimer); }
 }
 function broadcastQueue(mode) {
   const view = queueView(mode);
   for (const t of queues[mode]) io.to(t.socketId).emit('queue:update', { ...view, position: queues[mode].findIndex(x => x.socketId === t.socketId) + 1 });
 }
 function broadcastQueues() { Object.keys(queues).forEach(broadcastQueue); }
-function tryMakeMatches(mode) {
+function scheduleQueueTimer(mode) {
+  clearTimeout(queueTimers[mode]);
+  const deadline = queueDeadline(mode);
+  if (!deadline) return;
+  queueTimers[mode] = setTimeout(() => tryMakeMatches(mode, true), Math.max(0, deadline - Date.now()));
+}
+function emitMatch(mode, tickets, forcedByTimer = false) {
   const cfg = MATCH_CONFIG[mode] || MATCH_CONFIG.individual;
-  while (queues[mode].length >= cfg.size) {
-    const tickets = queues[mode].splice(0, cfg.size);
-    const matchId = `match_${String(matchSeq++).padStart(5, '0')}`;
-    const seed = crypto.randomInt(1, 2 ** 31 - 1);
-    const roster = tickets.map((t, i) => ({
-      id: t.profileId || t.socketId,
-      name: t.username,
+  const matchId = `match_${String(matchSeq++).padStart(5, '0')}`;
+  const seed = crypto.randomInt(1, 2 ** 31 - 1);
+  const roster = [];
+  for (let i = 0; i < cfg.size; i++) {
+    const t = tickets[i];
+    roster.push({
+      id: t ? (t.profileId || t.socketId) : `ai:${matchId}:${i + 1}`,
+      name: t ? t.username : `AI Raider ${i + 1}`,
       slot: i + 1,
       team: cfg.teams ? (i < cfg.teamSize ? 'A' : 'B') : null,
-    }));
-    for (const t of tickets) {
-      const socket = io.sockets.sockets.get(t.socketId);
-      if (!socket) continue;
-      socket.join(`match:${matchId}`);
-      const mine = roster.find(r => r.id === (t.profileId || t.socketId));
-      socket.emit('match:found', { matchId, mode, label: cfg.label, seed, roster, team: mine?.team || null, slot: mine?.slot || null, launchInMs: 3500 });
-    }
-    console.log(`match formed ${matchId} ${mode} players=${tickets.length}`);
+      isAI: !t,
+    });
   }
+  const aiCount = roster.filter(r => r.isAI).length;
+  for (const t of tickets) {
+    const socket = io.sockets.sockets.get(t.socketId);
+    if (!socket) continue;
+    socket.join(`match:${matchId}`);
+    const mine = roster.find(r => r.id === (t.profileId || t.socketId));
+    socket.emit('match:found', { matchId, mode, label: cfg.label, seed, roster, aiCount, forcedByTimer, team: mine?.team || null, slot: mine?.slot || null, launchInMs: 3500 });
+  }
+  console.log(`match formed ${matchId} ${mode} humans=${tickets.length} ai=${aiCount}${forcedByTimer ? ' timer' : ''}`);
+}
+function tryMakeMatches(mode, forceTimer = false) {
+  const cfg = MATCH_CONFIG[mode] || MATCH_CONFIG.individual;
+  while (queues[mode].length >= cfg.size) emitMatch(mode, queues[mode].splice(0, cfg.size), false);
+  const deadline = queueDeadline(mode);
+  if (forceTimer && queues[mode].length > 0 && deadline && Date.now() >= deadline) emitMatch(mode, queues[mode].splice(0, cfg.size), true);
   broadcastQueue(mode);
+  scheduleQueueTimer(mode);
 }
 
 io.on('connection', socket => {
@@ -358,6 +378,7 @@ io.on('connection', socket => {
     socket.emit('queue:joined', { mode, ...queueView(mode) });
     broadcastQueue(mode);
     tryMakeMatches(mode);
+    scheduleQueueTimer(mode);
   });
   socket.on('queue:leave', () => { removeFromQueues(socket.id); socket.emit('queue:left'); });
   socket.on('party:create', () => socket.emit('party:update', { id: newId('party'), code: crypto.randomBytes(3).toString('hex').toUpperCase(), members: [socket.id] }));
