@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: valley-town-online
+    runtime: node
+    plan: free
+    buildCommand: npm ci
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+      - key: DATABASE_URL
+        fromDatabase:
+          name: valley-town-online-db
+          property: connectionString
+
+databases:
+  - name: valley-town-online-db
+    databaseName: valley_town
+    user: valley_town_user
+    plan: free
