@@ -344,7 +344,7 @@ function emitMatch(mode, tickets, forcedByTimer = false) {
     });
   }
   const aiCount = roster.filter(r => r.isAI).length;
-  activeMatches.set(matchId, { matchId, mode, roster, players: new Map(), enemies: new Map(), loot: new Map(), lootClaims: new Set(), revives: [], bullets: [], inventories: new Map(), extraction: { started: false, by: null, at: null, endsAt: null, complete: false }, lastTick: Date.now(), tick: null, seq: 1 });
+  activeMatches.set(matchId, { matchId, mode, roster, players: new Map(), enemies: new Map(), loot: new Map(), lootClaims: new Set(), revives: [], bullets: [], inventories: new Map(), extraction: { started: false, by: null, at: null, endsAt: null, complete: false }, lastTick: Date.now(), createdAt: Date.now(), tick: null, seq: 1 });
   startMatchTicker(matchId);
   for (const t of tickets) {
     const socket = io.sockets.sockets.get(t.socketId);
@@ -385,6 +385,13 @@ function playerPayload(socket, data = {}) {
     hp: Number(data.hp) || 0,
     maxHp: Number(data.maxHp) || 0,
     dead: !!data.dead,
+    weaponKey: String(data.weaponKey || 'pistol'),
+    meds: Math.max(0, Math.min(9, Number(data.meds)||0)),
+    nades: Math.max(0, Math.min(9, Number(data.nades)||0)),
+    defibs: Math.max(0, Math.min(9, Number(data.defibs)||0)),
+    shield: Math.max(0, Math.min(12, Number(data.shield)||0)),
+    lootBagDropped: !!data.lootBagDropped,
+    aiLoot: Math.max(0, Number(data.aiLoot)||0),
     interior: data.interior || null,
     raiderClass: data.raiderClass || socket.data.raiderClass || 'Assault_Class',
     isAI: !!data.isAI,
@@ -404,6 +411,7 @@ function seedAiRaiders(match, anchor = {}) {
       team: r.team || null, slot: r.slot || null, isAI: true,
       x: ax + Math.cos(a) * d, y: ay + Math.sin(a) * d,
       ang: a + Math.PI, hp: 6, maxHp: 6, dead: false, interior: null,
+      weaponKey: n % 3 === 0 ? 'shotgun' : 'pistol', meds: 1, nades: n % 2, defibs: 1, shield: 0, aiLoot: 0, lootBagDropped: false,
       raiderClass: AI_RAIDER_CLASSES[n % AI_RAIDER_CLASSES.length],
       aiPhase: a, t: Date.now(),
     });
@@ -428,12 +436,39 @@ function emitSnapshot(matchId) {
   });
 }
 
+function addServerLoot(match, loot) {
+  const id = loot.id || `srvloot:${match.matchId}:${match.seq++}`;
+  const obj = { ...loot, id, x: Number(loot.x)||0, y: Number(loot.y)||0 };
+  match.loot.set(id, obj);
+  io.to(`match:${match.matchId}`).emit('raid:lootSpawn', obj);
+  return obj;
+}
+function dropPlayerLoot(match, player, killer = null) {
+  if (!match || !player || player.lootBagDropped) return [];
+  player.lootBagDropped = true;
+  const drops = [];
+  const x = Number(player.x)||0, y = Number(player.y)||0;
+  const jitter = () => ({ x: x + (Math.random() * 52 - 26), y: y + (Math.random() * 52 - 26) });
+  if (player.weaponKey && player.weaponKey !== 'pistol') drops.push(addServerLoot(match, { kind: 'weapon', weapon: player.weaponKey, ...jitter() }));
+  for (let i = 0; i < Math.min(3, player.meds || 0); i++) drops.push(addServerLoot(match, { kind: 'item', item: 'medkit', val: 1, ...jitter() }));
+  for (let i = 0; i < Math.min(3, player.nades || 0); i++) drops.push(addServerLoot(match, { kind: 'item', item: 'grenade', val: 1, ...jitter() }));
+  for (let i = 0; i < Math.min(3, player.defibs || 0); i++) drops.push(addServerLoot(match, { kind: 'item', item: 'defib', val: 1, ...jitter() }));
+  if ((player.shield || 0) > 0) drops.push(addServerLoot(match, { kind: 'item', item: 'plate', val: 1, ...jitter() }));
+  if ((player.aiLoot || 0) > 0) drops.push(addServerLoot(match, { kind: 'scrap', val: Math.max(4, Math.min(80, player.aiLoot * 6)), ...jitter() }));
+  io.to(`match:${match.matchId}`).emit('raid:playerKilled', { matchId: match.matchId, victim: player.id, victimName: player.name, killer, team: player.team, x, y, drops });
+  return drops;
+}
+function damageServerPlayer(match, player, amount, source) {
+  if (!match || !player || player.dead) return;
+  const dmg = Math.max(1, Math.min(20, Number(amount)||1));
+  if ((player.shield || 0) > 0) player.shield = Math.max(0, player.shield - dmg);
+  else player.hp = Math.max(0, (Number(player.hp)||0) - dmg);
+  player.lastDamageAt = Date.now(); player.lastDamageSource = source || null;
+  if (player.hp <= 0) { player.dead = true; dropPlayerLoot(match, player, source); }
+}
+
 function serverLoot(match, x, y) {
-  const kind = 'scrap';
-  const id = `srvloot:${match.matchId}:${match.seq++}`;
-  const loot = { id, kind, val: 4 + Math.floor(Math.random() * 14), x, y };
-  match.loot.set(id, loot);
-  return loot;
+  return addServerLoot(match, { kind: 'scrap', val: 4 + Math.floor(Math.random() * 14), x, y });
 }
 function startMatchTicker(matchId) {
   const match = activeMatches.get(matchId);
@@ -449,16 +484,38 @@ function tickMatch(matchId) {
   const alivePlayers = [...match.players.values()].filter(p => !p.dead);
   const humanPlayers = alivePlayers.filter(p => !p.isAI);
   for (const ai of alivePlayers.filter(p => p.isAI)) {
-    const target = humanPlayers[0];
-    if (target) {
-      const desired = 86 + ((ai.slot || 1) % 4) * 24;
-      const phase = (ai.aiPhase || 0) + now / 1300;
-      const tx = target.x + Math.cos(phase) * desired;
-      const ty = target.y + Math.sin(phase) * desired;
-      const dx = tx - ai.x, dy = ty - ai.y, d = Math.sqrt(dx * dx + dy * dy) || 1;
-      const sp = 92;
-      if (d > 8) { ai.x += (dx / d) * sp * dt; ai.y += (dy / d) * sp * dt; ai.ang = Math.atan2(dy, dx); ai.t = now; }
+    let targetEnemy = null, bestEnemy = Infinity;
+    for (const e of match.enemies.values()) {
+      if (e.dead || e.hp <= 0) continue;
+      const d2 = (e.x-ai.x)**2 + (e.y-ai.y)**2;
+      if (d2 < bestEnemy) { bestEnemy = d2; targetEnemy = e; }
     }
+    let targetLoot = null, bestLoot = Infinity;
+    for (const l of match.loot.values()) {
+      const d2 = (l.x-ai.x)**2 + (l.y-ai.y)**2;
+      if (d2 < bestLoot) { bestLoot = d2; targetLoot = l; }
+    }
+    const follow = humanPlayers.find(p => !ai.team || p.team === ai.team) || humanPlayers[0];
+    let tx = ai.x, ty = ai.y;
+    if (targetLoot && bestLoot < 420*420) { tx = targetLoot.x; ty = targetLoot.y; }
+    else if (targetEnemy && bestEnemy < 760*760) { tx = targetEnemy.x; ty = targetEnemy.y; }
+    else if (follow) {
+      const desired = 180 + ((ai.slot || 1) % 4) * 34;
+      const phase = (ai.aiPhase || 0) + now / 1500;
+      tx = follow.x + Math.cos(phase) * desired; ty = follow.y + Math.sin(phase) * desired;
+    }
+    const dx = tx - ai.x, dy = ty - ai.y, d = Math.sqrt(dx * dx + dy * dy) || 1;
+    const stop = targetEnemy && bestEnemy < 360*360 ? 220 : 18;
+    if (d > stop) { const sp = 102; ai.x += (dx / d) * sp * dt; ai.y += (dy / d) * sp * dt; ai.ang = Math.atan2(dy, dx); ai.t = now; }
+    if (targetEnemy && bestEnemy < 620*620 && now - (ai.lastShot || 0) > 700) {
+      ai.lastShot = now; ai.ang = Math.atan2(targetEnemy.y-ai.y, targetEnemy.x-ai.x);
+      const sp = 520;
+      const bullet = { id: `srvb:${matchId}:${match.seq++}`, owner: ai.id, x: ai.x, y: ai.y, vx: Math.cos(ai.ang)*sp, vy: Math.sin(ai.ang)*sp, t: 1.2, dmg: 3, pierce: 0, hit: [], ai: true };
+      match.bullets.push(bullet);
+      io.to(`match:${matchId}`).emit('raid:bullet', { matchId, from: ai.id, bullets: [bullet], serverTime: now });
+    }
+    if (targetLoot && bestLoot < 28*28) { match.loot.delete(targetLoot.id); match.lootClaims.add(targetLoot.id); ai.aiLoot = (ai.aiLoot || 0) + 1; io.to(`match:${matchId}`).emit('raid:lootClaim', { matchId, lootId: targetLoot.id, by: ai.name, from: ai.id }); }
+    if (!match.extraction.started && (ai.aiLoot || 0) >= 2 && now - (match.createdAt || 0) > 12000) match.extraction = { started: true, by: ai.id, at: now, endsAt: now + SERVER_EXTRACTION_MS, complete: false, x: ai.x, y: ai.y };
   }
   for (const e of match.enemies.values()) {
     if (e.dead || e.hp <= 0 || !alivePlayers.length) continue;
@@ -466,6 +523,8 @@ function tickMatch(matchId) {
     for (const p of alivePlayers) { const d = (p.x-e.x)**2 + (p.y-e.y)**2; if (d < best) { best = d; target = p; } }
     const d = Math.sqrt(best) || 1, speed = Number(e.speed) || 45;
     if (d > 38 && d < 900) { e.x += ((target.x-e.x)/d)*speed*dt; e.y += ((target.y-e.y)/d)*speed*dt; e.serverTime = now; }
+    if (d < (Number(e.r)||18) + 14 && now - (target.lastMobDamage || 0) > 900) { target.lastMobDamage = now; damageServerPlayer(match, target, e.contactDamage || 1, { type: 'mob', enemyId: e.id }); }
+    if ((e.type === 'hornet' || e.type === 'sentry' || e.type === 'stalker' || e.type === 'centipede') && d < 560 && now - (e.lastServerShot || 0) > 1200) { e.lastServerShot = now; damageServerPlayer(match, target, e.shotDamage || 1, { type: 'mob-shot', enemyId: e.id }); }
   }
   for (const b of match.bullets) {
     if (b.dead) continue;
@@ -483,6 +542,20 @@ function tickMatch(matchId) {
         break;
       }
     }
+      if (!b.dead) {
+      const owner = match.players.get(b.owner);
+      for (const p of match.players.values()) {
+        if (p.dead || p.id === b.owner || b.hit?.includes(p.id)) continue;
+        if (match.mode === 'teams' && owner?.team && p.team && owner.team === p.team) continue;
+        if ((p.x-b.x)**2 + (p.y-b.y)**2 <= (18+6)*(18+6)) {
+          b.hit = b.hit || []; b.hit.push(p.id);
+          damageServerPlayer(match, p, Math.max(1, Math.min(10, Number(b.dmg)||1)), { type: 'pvp', attacker: b.owner, attackerName: owner?.name || 'Raider' });
+          io.to(`match:${matchId}`).emit('raid:playerHit', { matchId, victim: p.id, attacker: b.owner, hp: p.hp, shield: p.shield || 0, dead: p.dead, x: p.x, y: p.y });
+          if (!b.pierce || b.hit.length > b.pierce) b.dead = true;
+          break;
+        }
+      }
+    }
   }
   match.bullets = match.bullets.filter(b => !b.dead);
   if (match.extraction.started && !match.extraction.complete) {
@@ -493,7 +566,7 @@ function tickMatch(matchId) {
   io.to(`match:${matchId}`).emit('raid:serverTick', { matchId, serverTime: now, players: [...match.players.values()], enemies: [...match.enemies.values()], bullets: match.bullets, loot: [...match.loot.values()], extraction: match.extraction });
 }
 function sanitizeEnemy(e) { return { id: String(e.id || `enemy:${Math.random()}`), type: String(e.type || 'drone'), x: Number(e.x)||0, y: Number(e.y)||0, r: Number(e.r)||18, hp: Math.max(0, Number(e.hp)||SERVER_ENEMY_DAMAGE[e.type]||20), speed: Math.min(160, Number(e.speed)||45), dead: !!e.dead, serverTime: Date.now() }; }
-function sanitizeLoot(l) { return { id: String(l.id || `loot:${Math.random()}`), kind: String(l.kind || 'scrap'), x: Number(l.x)||0, y: Number(l.y)||0, val: Math.max(1, Math.min(999, Number(l.val)||1)), ammo: l.ammo || null, mat: l.mat || null, weapon: l.weapon || null, blueprint: l.blueprint || null }; }
+function sanitizeLoot(l) { return { id: String(l.id || `loot:${Math.random()}`), kind: String(l.kind || 'scrap'), x: Number(l.x)||0, y: Number(l.y)||0, val: Math.max(1, Math.min(999, Number(l.val)||1)), ammo: l.ammo || null, mat: l.mat || null, weapon: l.weapon || null, blueprint: l.blueprint || null, item: l.item || null }; }
 function relayAuthoritative(socket, event, payload = {}) {
   const matchId = socket.data.matchId;
   if (!matchId || payload.matchId !== matchId) return;
@@ -574,6 +647,8 @@ io.on('connection', socket => {
     const match = activeMatches.get(matchId);
     if (!match) return;
     const player = playerPayload(socket, data);
+    const old = match.players.get(player.id);
+    if (old) { player.hp = Math.min(Number(player.hp)||0, Number(old.hp)||player.hp); player.shield = Math.min(Number(player.shield)||0, Number(old.shield)||player.shield); player.dead = old.dead || player.dead; player.lootBagDropped = old.lootBagDropped || player.lootBagDropped; player.aiLoot = old.aiLoot || player.aiLoot; }
     match.players.set(player.id, player);
     seedAiRaiders(match, data);
     socket.to(`match:${matchId}`).emit('raid:peer', player);
