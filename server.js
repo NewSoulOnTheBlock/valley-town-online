@@ -294,6 +294,7 @@ const MATCH_CONFIG = {
 };
 const queues = { individual: [], teams: [] };
 const queueTimers = {};
+const activeMatches = new Map();
 const QUEUE_TIMEOUT_MS = Number(process.env.QUEUE_TIMEOUT_MS || 60_000);
 let matchSeq = 1;
 
@@ -339,6 +340,7 @@ function emitMatch(mode, tickets, forcedByTimer = false) {
     });
   }
   const aiCount = roster.filter(r => r.isAI).length;
+  activeMatches.set(matchId, { matchId, mode, roster, players: new Map(), enemies: new Map(), lootClaims: new Set(), revives: [], extraction: { started: false, by: null, at: null } });
   for (const t of tickets) {
     const socket = io.sockets.sockets.get(t.socketId);
     if (!socket) continue;
@@ -346,6 +348,7 @@ function emitMatch(mode, tickets, forcedByTimer = false) {
     socket.data.matchId = matchId;
     socket.data.matchMode = mode;
     const mine = roster.find(r => r.id === (t.profileId || t.socketId));
+    socket.data.team = mine?.team || null; socket.data.slot = mine?.slot || null;
     socket.emit('match:found', { matchId, mode, label: cfg.label, seed, roster, aiCount, forcedByTimer, team: mine?.team || null, slot: mine?.slot || null, launchInMs: 3500 });
   }
   console.log(`match formed ${matchId} ${mode} humans=${tickets.length} ai=${aiCount}${forcedByTimer ? ' timer' : ''}`);
@@ -357,6 +360,59 @@ function tryMakeMatches(mode, forceTimer = false) {
   if (forceTimer && queues[mode].length > 0 && deadline && Date.now() >= deadline) emitMatch(mode, queues[mode].splice(0, cfg.size), true);
   broadcastQueue(mode);
   scheduleQueueTimer(mode);
+}
+
+
+function cleanMatch(matchId) {
+  const room = io.sockets.adapter.rooms.get(`match:${matchId}`);
+  if (!room || room.size === 0) activeMatches.delete(matchId);
+}
+function playerPayload(socket, data = {}) {
+  return {
+    id: socket.data.profileId || socket.id,
+    socketId: socket.id,
+    name: socket.data.username || `Raider-${socket.id.slice(0, 4)}`,
+    team: data.team || socket.data.team || null,
+    slot: data.slot || socket.data.slot || null,
+    x: Number(data.x) || 0,
+    y: Number(data.y) || 0,
+    ang: Number(data.ang) || 0,
+    hp: Number(data.hp) || 0,
+    maxHp: Number(data.maxHp) || 0,
+    dead: !!data.dead,
+    interior: data.interior || null,
+    t: Date.now(),
+  };
+}
+function emitSnapshot(matchId) {
+  const match = activeMatches.get(matchId);
+  if (!match) return;
+  io.to(`match:${matchId}`).emit('raid:snapshot', {
+    matchId,
+    serverTime: Date.now(),
+    players: [...match.players.values()],
+    enemies: [...match.enemies.values()],
+    lootClaims: [...match.lootClaims.values()],
+    revives: match.revives.slice(-20),
+    extraction: match.extraction,
+  });
+}
+function relayAuthoritative(socket, event, payload = {}) {
+  const matchId = socket.data.matchId;
+  if (!matchId || payload.matchId !== matchId) return;
+  const match = activeMatches.get(matchId);
+  if (!match) return;
+  const from = socket.data.profileId || socket.id;
+  const data = { ...payload, from, by: socket.data.username, serverTime: Date.now() };
+  if (event === 'raid:enemyHit') {
+    const id = String(payload.enemyId || '');
+    if (id) match.enemies.set(id, { id, hp: Math.max(0, Number(payload.hp) || 0), x: Number(payload.x) || 0, y: Number(payload.y) || 0, type: payload.type || 'enemy', dead: !!payload.dead, serverTime: Date.now() });
+  }
+  if (event === 'raid:lootClaim' && payload.lootId) match.lootClaims.add(String(payload.lootId));
+  if (event === 'raid:revive') match.revives.push(data);
+  if (event === 'raid:extract') match.extraction = { started: true, by: from, at: Date.now(), x: Number(payload.x)||0, y: Number(payload.y)||0 };
+  socket.to(`match:${matchId}`).emit(event, data);
+  emitSnapshot(matchId);
 }
 
 io.on('connection', socket => {
@@ -383,19 +439,31 @@ io.on('connection', socket => {
     scheduleQueueTimer(mode);
   });
   socket.on('queue:leave', () => { removeFromQueues(socket.id); socket.emit('queue:left'); });
+  socket.on('raid:ready', (data = {}) => {
+    const matchId = socket.data.matchId;
+    if (!matchId || data.matchId !== matchId) return;
+    const match = activeMatches.get(matchId);
+    if (!match) return;
+    match.players.set(socket.data.profileId || socket.id, playerPayload(socket, data));
+    emitSnapshot(matchId);
+  });
   socket.on('raid:update', (data = {}) => {
     const matchId = socket.data.matchId;
     if (!matchId || data.matchId !== matchId) return;
-    socket.to(`match:${matchId}`).emit('raid:peer', {
-      id: socket.data.profileId || socket.id,
-      name: socket.data.username || `Raider-${socket.id.slice(0, 4)}`,
-      team: data.team || null, slot: data.slot || null, x: Number(data.x)||0, y: Number(data.y)||0,
-      ang: Number(data.ang)||0, hp: Number(data.hp)||0, maxHp: Number(data.maxHp)||0, dead: !!data.dead,
-      interior: data.interior || null, t: Date.now(),
-    });
+    const match = activeMatches.get(matchId);
+    if (!match) return;
+    const player = playerPayload(socket, data);
+    match.players.set(player.id, player);
+    socket.to(`match:${matchId}`).emit('raid:peer', player);
+    emitSnapshot(matchId);
   });
+  socket.on('raid:bullet', data => relayAuthoritative(socket, 'raid:bullet', data));
+  socket.on('raid:enemyHit', data => relayAuthoritative(socket, 'raid:enemyHit', data));
+  socket.on('raid:lootClaim', data => relayAuthoritative(socket, 'raid:lootClaim', data));
+  socket.on('raid:revive', data => relayAuthoritative(socket, 'raid:revive', data));
+  socket.on('raid:extract', data => relayAuthoritative(socket, 'raid:extract', data));
   socket.on('party:create', () => socket.emit('party:update', { id: newId('party'), code: crypto.randomBytes(3).toString('hex').toUpperCase(), members: [socket.id] }));
-  socket.on('disconnect', () => { if (socket.data.matchId) socket.to(`match:${socket.data.matchId}`).emit('raid:left', { id: socket.data.profileId || socket.id }); removeFromQueues(socket.id); });
+  socket.on('disconnect', () => { if (socket.data.matchId) { const id = socket.data.profileId || socket.id; const match = activeMatches.get(socket.data.matchId); if (match) match.players.delete(id); socket.to(`match:${socket.data.matchId}`).emit('raid:left', { id }); emitSnapshot(socket.data.matchId); cleanMatch(socket.data.matchId); } removeFromQueues(socket.id); });
 });
 
 const port = Number(process.env.PORT || 4173);
