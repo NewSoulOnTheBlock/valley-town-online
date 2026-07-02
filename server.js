@@ -210,9 +210,81 @@ app.use((err, _req, res, _next) => {
 
 const httpServer = createServer(app);
 const io = new SocketIOServer(httpServer, { cors: { origin: true } });
+
+const MATCH_CONFIG = {
+  individual: { label: 'Individual', size: 8, teams: false },
+  teams: { label: 'Teams', size: 8, teams: true, teamSize: 4 },
+};
+const queues = { individual: [], teams: [] };
+let matchSeq = 1;
+
+function queueView(mode) {
+  const cfg = MATCH_CONFIG[mode] || MATCH_CONFIG.individual;
+  return { mode, label: cfg.label, count: queues[mode].length, needed: cfg.size, players: queues[mode].map((t, i) => ({ name: t.username, position: i + 1 })) };
+}
+function removeFromQueues(socketId) {
+  let removed = false;
+  for (const mode of Object.keys(queues)) {
+    const before = queues[mode].length;
+    queues[mode] = queues[mode].filter(t => t.socketId !== socketId);
+    removed ||= queues[mode].length !== before;
+  }
+  if (removed) broadcastQueues();
+}
+function broadcastQueue(mode) {
+  const view = queueView(mode);
+  for (const t of queues[mode]) io.to(t.socketId).emit('queue:update', { ...view, position: queues[mode].findIndex(x => x.socketId === t.socketId) + 1 });
+}
+function broadcastQueues() { Object.keys(queues).forEach(broadcastQueue); }
+function tryMakeMatches(mode) {
+  const cfg = MATCH_CONFIG[mode] || MATCH_CONFIG.individual;
+  while (queues[mode].length >= cfg.size) {
+    const tickets = queues[mode].splice(0, cfg.size);
+    const matchId = `match_${String(matchSeq++).padStart(5, '0')}`;
+    const seed = crypto.randomInt(1, 2 ** 31 - 1);
+    const roster = tickets.map((t, i) => ({
+      id: t.profileId || t.socketId,
+      name: t.username,
+      slot: i + 1,
+      team: cfg.teams ? (i < cfg.teamSize ? 'A' : 'B') : null,
+    }));
+    for (const t of tickets) {
+      const socket = io.sockets.sockets.get(t.socketId);
+      if (!socket) continue;
+      socket.join(`match:${matchId}`);
+      const mine = roster.find(r => r.id === (t.profileId || t.socketId));
+      socket.emit('match:found', { matchId, mode, label: cfg.label, seed, roster, team: mine?.team || null, slot: mine?.slot || null, launchInMs: 3500 });
+    }
+    console.log(`match formed ${matchId} ${mode} players=${tickets.length}`);
+  }
+  broadcastQueue(mode);
+}
+
 io.on('connection', socket => {
-  socket.emit('hello', { t: 'hello', socketId: socket.id, note: 'Lobby/matchmaking transport placeholder ready.' });
+  socket.data.username = `Raider-${socket.id.slice(0, 4)}`;
+  socket.emit('hello', { t: 'hello', socketId: socket.id, note: 'Socket.IO matchmaking ready.' });
+  socket.on('auth:hello', async ({ token, username } = {}) => {
+    try {
+      const profile = await authFromToken(token);
+      socket.data.profileId = profile?.id || null;
+      socket.data.username = profile?.username || displayUsername(username || socket.data.username);
+      socket.emit('auth:ok', { username: socket.data.username, profileId: socket.data.profileId });
+    } catch {
+      socket.data.username = displayUsername(username || socket.data.username);
+      socket.emit('auth:ok', { username: socket.data.username, profileId: null });
+    }
+  });
+  socket.on('queue:join', ({ mode = 'individual' } = {}) => {
+    mode = MATCH_CONFIG[mode] ? mode : 'individual';
+    removeFromQueues(socket.id);
+    queues[mode].push({ socketId: socket.id, profileId: socket.data.profileId || null, username: socket.data.username || `Raider-${socket.id.slice(0, 4)}`, enqueuedAt: Date.now() });
+    socket.emit('queue:joined', { mode, ...queueView(mode) });
+    broadcastQueue(mode);
+    tryMakeMatches(mode);
+  });
+  socket.on('queue:leave', () => { removeFromQueues(socket.id); socket.emit('queue:left'); });
   socket.on('party:create', () => socket.emit('party:update', { id: newId('party'), code: crypto.randomBytes(3).toString('hex').toUpperCase(), members: [socket.id] }));
+  socket.on('disconnect', () => removeFromQueues(socket.id));
 });
 
 const port = Number(process.env.PORT || 4173);
