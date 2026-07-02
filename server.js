@@ -7,6 +7,7 @@ import { fileURLToPath } from 'url';
 import { createServer } from 'http';
 import { Server as SocketIOServer } from 'socket.io';
 import pg from 'pg';
+import { getAddress, verifyMessage } from 'ethers';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -16,6 +17,8 @@ const PUBLIC_DIR = path.join(__dirname, 'public');
 const SESSION_BYTES = 32;
 const PASSWORD_ITERS = 120_000;
 const DATABASE_URL = process.env.DATABASE_URL;
+const ROBINHOOD_CHAIN_ID = process.env.ROBINHOOD_CHAIN_ID || '';
+const ROBINHOOD_CHAIN_NAME = process.env.ROBINHOOD_CHAIN_NAME || 'Robinhood Chain';
 
 const pool = DATABASE_URL ? new pg.Pool({
   connectionString: DATABASE_URL,
@@ -24,6 +27,7 @@ const pool = DATABASE_URL ? new pg.Pool({
 
 let fileDb = { users: {}, sessions: {} };
 let schemaReady = false;
+const walletNonces = new Map();
 
 function normalizeUsername(username) {
   return String(username || '').trim().toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 24);
@@ -49,7 +53,25 @@ function verifyPassword(password, stored) {
   return crypto.timingSafeEqual(Buffer.from(got), Buffer.from(hash));
 }
 function publicProfile(row) {
-  return { id: row.id, username: row.username, data: row.data || {}, updatedAt: row.updated_at || row.updatedAt || null };
+  return { id: row.id, username: row.username, walletAddress: row.wallet_address || row.walletAddress || row.data?.walletAddress || null, data: row.data || {}, updatedAt: row.updated_at || row.updatedAt || null };
+}
+function normalizeWalletAddress(address) {
+  try { return getAddress(String(address || '').trim()); }
+  catch { throw Object.assign(new Error('invalid wallet address'), { status: 400 }); }
+}
+function walletLoginMessage(address, nonce) {
+  return `Valley Town login\nWallet: ${address}\nNonce: ${nonce}\nChain: ${ROBINHOOD_CHAIN_NAME}`;
+}
+function newWalletNonce(address) {
+  const nonce = crypto.randomBytes(24).toString('base64url');
+  walletNonces.set(address.toLowerCase(), { nonce, createdAt: Date.now() });
+  return nonce;
+}
+function consumeWalletNonce(address, nonce) {
+  const key = address.toLowerCase();
+  const rec = walletNonces.get(key);
+  walletNonces.delete(key);
+  return !!rec && rec.nonce === nonce && Date.now() - rec.createdAt < 10 * 60_000;
 }
 
 async function loadFileDb() {
@@ -78,9 +100,11 @@ async function ensureSchema() {
       username TEXT UNIQUE NOT NULL,
       password_hash TEXT NOT NULL,
       data JSONB NOT NULL DEFAULT '{}'::jsonb,
+      wallet_address TEXT UNIQUE,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+    ALTER TABLE profiles ADD COLUMN IF NOT EXISTS wallet_address TEXT UNIQUE;
     CREATE TABLE IF NOT EXISTS sessions (
       token TEXT PRIMARY KEY,
       profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
@@ -130,12 +154,53 @@ async function loginProfile(username, password) {
   else { fileDb.sessions[token] = { profile_id: row.id, username: clean, createdAt: new Date().toISOString() }; await saveFileDb(); }
   return { token, profile: publicProfile(row) };
 }
+async function walletProfile(address, profileName) {
+  await ensureSchema();
+  const wallet = normalizeWalletAddress(address);
+  const clean = profileName ? displayUsername(profileName) : '';
+  if (pool) {
+    const existing = await pool.query('SELECT id, username, wallet_address, data, updated_at FROM profiles WHERE lower(wallet_address)=lower($1)', [wallet]);
+    if (existing.rows[0]) return existing.rows[0];
+    if (!clean || clean.length < 3) throw Object.assign(new Error('choose a profile name to bind this wallet'), { status: 409, needProfileName: true });
+    try {
+      const id = newId('profile');
+      const initialData = { walletAddress: wallet, auth: 'wallet', chain: ROBINHOOD_CHAIN_NAME };
+      const { rows } = await pool.query(
+        'INSERT INTO profiles (id, username, password_hash, wallet_address, data) VALUES ($1,$2,$3,$4,$5) RETURNING id, username, wallet_address, data, updated_at',
+        [id, clean, 'wallet:' + wallet.toLowerCase(), wallet, initialData]
+      );
+      return rows[0];
+    } catch (e) {
+      if (String(e.code) === '23505') throw Object.assign(new Error('profile name or wallet already exists'), { status: 409 });
+      throw e;
+    }
+  }
+  const existing = Object.values(fileDb.users).find(u => String(u.wallet_address || u.walletAddress || '').toLowerCase() === wallet.toLowerCase());
+  if (existing) return existing;
+  if (!clean || clean.length < 3) throw Object.assign(new Error('choose a profile name to bind this wallet'), { status: 409, needProfileName: true });
+  if (fileDb.users[clean]) throw Object.assign(new Error('profile name already exists'), { status: 409 });
+  const row = { id: newId('profile'), username: clean, password_hash: 'wallet:' + wallet.toLowerCase(), wallet_address: wallet, data: { walletAddress: wallet, auth: 'wallet', chain: ROBINHOOD_CHAIN_NAME }, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+  fileDb.users[clean] = row;
+  await saveFileDb();
+  return row;
+}
+async function loginWithWallet({ address, signature, nonce, profileName }) {
+  const wallet = normalizeWalletAddress(address);
+  if (!consumeWalletNonce(wallet, nonce)) throw Object.assign(new Error('wallet login challenge expired'), { status: 401 });
+  const recovered = getAddress(verifyMessage(walletLoginMessage(wallet, nonce), signature || ''));
+  if (recovered.toLowerCase() !== wallet.toLowerCase()) throw Object.assign(new Error('wallet signature did not match'), { status: 401 });
+  const row = await walletProfile(wallet, profileName);
+  const token = newToken();
+  if (pool) await pool.query('INSERT INTO sessions (token, profile_id) VALUES ($1,$2)', [token, row.id]);
+  else { fileDb.sessions[token] = { profile_id: row.id, username: row.username, createdAt: new Date().toISOString() }; await saveFileDb(); }
+  return { token, profile: publicProfile(row) };
+}
 async function authFromToken(token) {
   await ensureSchema();
   if (!token) return null;
   if (pool) {
     const { rows } = await pool.query(
-      `SELECT p.id, p.username, p.data, p.updated_at
+      `SELECT p.id, p.username, p.wallet_address, p.data, p.updated_at
        FROM sessions s JOIN profiles p ON p.id=s.profile_id
        WHERE s.token=$1`, [token]
     );
@@ -151,7 +216,7 @@ async function saveProfileData(profileId, data) {
   await ensureSchema();
   const cleanData = data && typeof data === 'object' ? data : {};
   if (pool) {
-    const { rows } = await pool.query('UPDATE profiles SET data=$2, updated_at=NOW() WHERE id=$1 RETURNING id, username, data, updated_at', [profileId, cleanData]);
+    const { rows } = await pool.query('UPDATE profiles SET data=$2, updated_at=NOW() WHERE id=$1 RETURNING id, username, wallet_address, data, updated_at', [profileId, cleanData]);
     return rows[0];
   }
   const user = Object.values(fileDb.users).find(u => u.id === profileId);
@@ -179,6 +244,18 @@ async function requireAuth(req, res, next) {
 
 app.get('/api/health', async (_req, res, next) => {
   try { await ensureSchema(); res.json({ ok: true, store: pool ? 'postgres' : 'file' }); }
+  catch (e) { next(e); }
+});
+app.get('/api/wallet-config', (_req, res) => res.json({ chainName: ROBINHOOD_CHAIN_NAME, chainId: ROBINHOOD_CHAIN_ID || null }));
+app.post('/api/wallet-challenge', async (req, res, next) => {
+  try {
+    const address = normalizeWalletAddress(req.body.address);
+    const nonce = newWalletNonce(address);
+    res.json({ address, nonce, message: walletLoginMessage(address, nonce), chainName: ROBINHOOD_CHAIN_NAME, chainId: ROBINHOOD_CHAIN_ID || null });
+  } catch (e) { next(e); }
+});
+app.post('/api/wallet-login', async (req, res, next) => {
+  try { res.json(await loginWithWallet(req.body)); }
   catch (e) { next(e); }
 });
 app.post('/api/register', async (req, res, next) => {
