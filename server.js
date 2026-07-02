@@ -458,6 +458,13 @@ function dropPlayerLoot(match, player, killer = null) {
   io.to(`match:${match.matchId}`).emit('raid:playerKilled', { matchId: match.matchId, victim: player.id, victimName: player.name, killer, team: player.team, x, y, drops });
   return drops;
 }
+function segDist2(px, py, ax, ay, bx, by) {
+  const vx = bx - ax, vy = by - ay, wx = px - ax, wy = py - ay;
+  const c = vx * vx + vy * vy || 1;
+  const t = Math.max(0, Math.min(1, (wx * vx + wy * vy) / c));
+  const x = ax + vx * t, y = ay + vy * t;
+  return (px - x) ** 2 + (py - y) ** 2;
+}
 function damageServerPlayer(match, player, amount, source) {
   if (!match || !player || player.dead) return;
   const dmg = Math.max(1, Math.min(20, Number(amount)||1));
@@ -528,12 +535,13 @@ function tickMatch(matchId) {
   }
   for (const b of match.bullets) {
     if (b.dead) continue;
+    const ox = b.x, oy = b.y;
     b.x += b.vx * dt; b.y += b.vy * dt; b.t -= dt;
     if (b.t <= 0 || b.x < 0 || b.y < 0 || b.x > 14000 || b.y > 14000) { b.dead = true; continue; }
     for (const e of match.enemies.values()) {
       if (e.dead || e.hp <= 0 || b.hit?.includes(e.id)) continue;
       const r = Number(e.r) || 18;
-      if ((e.x-b.x)**2 + (e.y-b.y)**2 <= (r+6)*(r+6)) {
+      if (segDist2(e.x,e.y,ox,oy,b.x,b.y) <= (r+6)*(r+6)) {
         b.hit = b.hit || []; b.hit.push(e.id);
         e.hp = Math.max(0, Number(e.hp || SERVER_ENEMY_DAMAGE[e.type] || 20) - Math.min(80, Number(b.dmg) || 1));
         e.serverTime = now;
@@ -547,7 +555,7 @@ function tickMatch(matchId) {
       for (const p of match.players.values()) {
         if (p.dead || p.id === b.owner || b.hit?.includes(p.id)) continue;
         if (match.mode === 'teams' && owner?.team && p.team && owner.team === p.team) continue;
-        if ((p.x-b.x)**2 + (p.y-b.y)**2 <= (18+6)*(18+6)) {
+        if (segDist2(p.x,p.y,ox,oy,b.x,b.y) <= (18+6)*(18+6)) {
           b.hit = b.hit || []; b.hit.push(p.id);
           damageServerPlayer(match, p, Math.max(1, Math.min(10, Number(b.dmg)||1)), { type: 'pvp', attacker: b.owner, attackerName: owner?.name || 'Raider' });
           io.to(`match:${matchId}`).emit('raid:playerHit', { matchId, victim: p.id, attacker: b.owner, hp: p.hp, shield: p.shield || 0, dead: p.dead, x: p.x, y: p.y });
