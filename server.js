@@ -7,7 +7,6 @@ import { fileURLToPath } from 'url';
 import { createServer } from 'http';
 import { Server as SocketIOServer } from 'socket.io';
 import pg from 'pg';
-import { getAddress, verifyMessage } from 'ethers';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -17,8 +16,7 @@ const PUBLIC_DIR = path.join(__dirname, 'public');
 const SESSION_BYTES = 32;
 const PASSWORD_ITERS = 120_000;
 const DATABASE_URL = process.env.DATABASE_URL;
-const ROBINHOOD_CHAIN_ID = process.env.ROBINHOOD_CHAIN_ID || '';
-const ROBINHOOD_CHAIN_NAME = process.env.ROBINHOOD_CHAIN_NAME || 'Robinhood Chain';
+const WALLET_ADAPTER_NAME = process.env.WALLET_ADAPTER_NAME || 'Solana Mobile Wallet Adapter';
 
 const pool = DATABASE_URL ? new pg.Pool({
   connectionString: DATABASE_URL,
@@ -55,12 +53,45 @@ function verifyPassword(password, stored) {
 function publicProfile(row) {
   return { id: row.id, username: row.username, walletAddress: row.wallet_address || row.walletAddress || row.data?.walletAddress || null, data: row.data || {}, updatedAt: row.updated_at || row.updatedAt || null };
 }
+const B58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+function decodeBase58(str) {
+  const s = String(str || '').trim();
+  if (!s) throw new Error('empty base58');
+  let bytes = [0];
+  for (const ch of s) {
+    const val = B58_ALPHABET.indexOf(ch);
+    if (val < 0) throw new Error('invalid base58');
+    let carry = val;
+    for (let i = 0; i < bytes.length; i++) {
+      carry += bytes[i] * 58;
+      bytes[i] = carry & 0xff;
+      carry >>= 8;
+    }
+    while (carry) { bytes.push(carry & 0xff); carry >>= 8; }
+  }
+  for (const ch of s) { if (ch === '1') bytes.push(0); else break; }
+  return Buffer.from(bytes.reverse());
+}
 function normalizeWalletAddress(address) {
-  try { return getAddress(String(address || '').trim()); }
-  catch { throw Object.assign(new Error('invalid wallet address'), { status: 400 }); }
+  const wallet = String(address || '').trim();
+  try { if (decodeBase58(wallet).length !== 32) throw new Error('bad length'); }
+  catch { throw Object.assign(new Error('invalid Solana wallet address'), { status: 400 }); }
+  return wallet;
+}
+function verifySolanaSignature(address, message, signature) {
+  const pub = decodeBase58(address);
+  let sig = signature;
+  if (Array.isArray(sig)) sig = Buffer.from(sig);
+  else if (typeof sig === 'string') sig = /^[0-9a-f]+$/i.test(sig) ? Buffer.from(sig, 'hex') : decodeBase58(sig);
+  else if (sig && typeof sig === 'object' && Array.isArray(sig.data)) sig = Buffer.from(sig.data);
+  else sig = Buffer.from(sig || []);
+  if (sig.length !== 64) return false;
+  const spki = Buffer.concat([Buffer.from('302a300506032b6570032100', 'hex'), pub]);
+  const key = crypto.createPublicKey({ key: spki, format: 'der', type: 'spki' });
+  return crypto.verify(null, Buffer.from(message), key, sig);
 }
 function walletLoginMessage(address, nonce) {
-  return `Valley Town login\nWallet: ${address}\nNonce: ${nonce}\nChain: ${ROBINHOOD_CHAIN_NAME}`;
+  return `Solana Raiders login\nWallet: ${address}\nNonce: ${nonce}\nAdapter: ${WALLET_ADAPTER_NAME}`;
 }
 function newWalletNonce(address) {
   const nonce = crypto.randomBytes(24).toString('base64url');
@@ -164,7 +195,7 @@ async function walletProfile(address, profileName) {
     if (!clean || clean.length < 3) throw Object.assign(new Error('choose a profile name to bind this wallet'), { status: 409, needProfileName: true });
     try {
       const id = newId('profile');
-      const initialData = { walletAddress: wallet, auth: 'wallet', chain: ROBINHOOD_CHAIN_NAME };
+      const initialData = { walletAddress: wallet, auth: 'wallet', chain: WALLET_ADAPTER_NAME };
       const { rows } = await pool.query(
         'INSERT INTO profiles (id, username, password_hash, wallet_address, data) VALUES ($1,$2,$3,$4,$5) RETURNING id, username, wallet_address, data, updated_at',
         [id, clean, 'wallet:' + wallet.toLowerCase(), wallet, initialData]
@@ -179,7 +210,7 @@ async function walletProfile(address, profileName) {
   if (existing) return existing;
   if (!clean || clean.length < 3) throw Object.assign(new Error('choose a profile name to bind this wallet'), { status: 409, needProfileName: true });
   if (fileDb.users[clean]) throw Object.assign(new Error('profile name already exists'), { status: 409 });
-  const row = { id: newId('profile'), username: clean, password_hash: 'wallet:' + wallet.toLowerCase(), wallet_address: wallet, data: { walletAddress: wallet, auth: 'wallet', chain: ROBINHOOD_CHAIN_NAME }, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+  const row = { id: newId('profile'), username: clean, password_hash: 'wallet:' + wallet.toLowerCase(), wallet_address: wallet, data: { walletAddress: wallet, auth: 'wallet', chain: WALLET_ADAPTER_NAME }, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
   fileDb.users[clean] = row;
   await saveFileDb();
   return row;
@@ -187,8 +218,7 @@ async function walletProfile(address, profileName) {
 async function loginWithWallet({ address, signature, nonce, profileName }) {
   const wallet = normalizeWalletAddress(address);
   if (!consumeWalletNonce(wallet, nonce)) throw Object.assign(new Error('wallet login challenge expired'), { status: 401 });
-  const recovered = getAddress(verifyMessage(walletLoginMessage(wallet, nonce), signature || ''));
-  if (recovered.toLowerCase() !== wallet.toLowerCase()) throw Object.assign(new Error('wallet signature did not match'), { status: 401 });
+  if (!verifySolanaSignature(wallet, walletLoginMessage(wallet, nonce), signature)) throw Object.assign(new Error('wallet signature did not match'), { status: 401 });
   const row = await walletProfile(wallet, profileName);
   const token = newToken();
   if (pool) await pool.query('INSERT INTO sessions (token, profile_id) VALUES ($1,$2)', [token, row.id]);
@@ -246,12 +276,12 @@ app.get('/api/health', async (_req, res, next) => {
   try { await ensureSchema(); res.json({ ok: true, store: pool ? 'postgres' : 'file' }); }
   catch (e) { next(e); }
 });
-app.get('/api/wallet-config', (_req, res) => res.json({ chainName: ROBINHOOD_CHAIN_NAME, chainId: ROBINHOOD_CHAIN_ID || null }));
+app.get('/api/wallet-config', (_req, res) => res.json({ adapterName: WALLET_ADAPTER_NAME, chainName: WALLET_ADAPTER_NAME, cluster: 'solana' }));
 app.post('/api/wallet-challenge', async (req, res, next) => {
   try {
     const address = normalizeWalletAddress(req.body.address);
     const nonce = newWalletNonce(address);
-    res.json({ address, nonce, message: walletLoginMessage(address, nonce), chainName: ROBINHOOD_CHAIN_NAME, chainId: ROBINHOOD_CHAIN_ID || null });
+    res.json({ address, nonce, message: walletLoginMessage(address, nonce), adapterName: WALLET_ADAPTER_NAME, cluster: 'solana' });
   } catch (e) { next(e); }
 });
 app.post('/api/wallet-login', async (req, res, next) => {
